@@ -1,0 +1,399 @@
+# main.py
+"""
+Multi-tenant AI calling backend
+
+Features:
+- /register -> register client, save prompt to Supabase, generate webhook_url
+- /webhook/{client_id} -> Twilio incoming call webhook (returns TwiML with <Record>)
+- /recording/{client_id} -> Twilio posts recording metadata; background worker downloads audio,
+    runs STT -> LLM -> TTS and updates Supabase with transcript/response/audio URL
+- /client/{client_id}/calls -> list calls for client (proxy)
+"""
+
+import os
+import uuid
+import datetime
+import tempfile
+import requests
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi.responses import PlainTextResponse, JSONResponse
+from pydantic import BaseModel
+from typing import Optional
+
+# Optional AI libraries (loaded lazily)
+try:
+    import whisper
+except Exception:
+    whisper = None
+
+try:
+    # GPT4All python lib (needs model binary available)
+    from gpt4all import GPT4All
+except Exception:
+    GPT4All = None
+
+try:
+    # Coqui TTS
+    from TTS.api import TTS
+except Exception:
+    TTS = None
+
+# ---------- Config from env ----------
+SUPABASE_URL = os.getenv("SUPABASE_URL")  # e.g. https://xyzcompany.supabase.co
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # service_role key (server-side)
+BASE_URL = os.getenv("BASE_URL", "https://your-backend.run.app")  # public URL of service
+TWILIO_RECORDING_MAX_SECONDS = int(os.getenv("TWILIO_RECORDING_MAX_SECONDS", "300"))
+
+# For downloading Twilio recordings (if private)
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
+# Optional: path to offline GPT4All model binary (if using)
+GPT4ALL_MODEL_PATH = os.getenv("GPT4ALL_MODEL_PATH")  # e.g. "/models/gpt4all-l13b-snoozy.bin"
+
+# Optional: Supabase storage settings to upload generated AI audio
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET")  # e.g. "recordings"
+SUPABASE_STORAGE_URL = os.getenv("SUPABASE_STORAGE_URL")  # e.g. https://xyz.supabase.co/storage/v1/object
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("Set SUPABASE_URL and SUPABASE_KEY environment variables")
+
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+}
+
+app = FastAPI(title="Multi-tenant AI Calling Backend")
+
+# ---------- Pydantic models ----------
+class RegisterClientRequest(BaseModel):
+    name: str
+    email: str
+    prompt: str
+
+class UpdatePromptRequest(BaseModel):
+    prompt: str
+
+# ---------- Supabase helper functions ----------
+def supa_post(table: str, payload: dict):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    r = requests.post(url, json=payload, headers=HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+def supa_patch(table: str, match: dict, payload: dict):
+    # match: {"id": "uuid"}
+    query = "?"
+    for k, v in match.items():
+        query += f"{k}=eq.{v}&"
+    url = f"{SUPABASE_URL}/rest/v1/{table}{query.rstrip('&')}"
+    r = requests.patch(url, json=payload, headers=HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+def supa_get(table: str, match: dict):
+    query = "?"
+    for k, v in match.items():
+        query += f"{k}=eq.{v}&"
+    url = f"{SUPABASE_URL}/rest/v1/{table}{query.rstrip('&')}"
+    r = requests.get(url, headers=HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+def supa_upload_file(local_path: str, dest_path: str):
+    """
+    Upload a file to Supabase Storage via REST (requires anon/public or service role).
+    Requires SUPABASE_STORAGE_BUCKET and SUPABASE_STORAGE_URL to be set.
+    """
+    if not SUPABASE_STORAGE_BUCKET or not SUPABASE_STORAGE_URL:
+        return None
+    url = f"{SUPABASE_STORAGE_URL}/{SUPABASE_STORAGE_BUCKET}/{dest_path}"
+    with open(local_path, "rb") as f:
+        headers = {
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+        }
+        resp = requests.put(url, data=f, headers=headers)
+        resp.raise_for_status()
+        # return public URL (bucket might be public)
+        return url
+    return None
+
+# ---------- Endpoints ----------
+@app.post("/register", response_model=dict)
+def register_client(data: RegisterClientRequest):
+    """
+    Register a new client: save client record, generate webhook URL and return it.
+    """
+    client_id = str(uuid.uuid4())
+    webhook_path = f"/webhook/{client_id}"
+    webhook_url = f"{BASE_URL}{webhook_path}"
+
+    payload = {
+        "id": client_id,
+        "name": data.name,
+        "email": data.email,
+        "prompt": data.prompt,
+        "webhook_url": webhook_url,
+        "created_at": datetime.datetime.utcnow().isoformat()
+    }
+
+    supa_post("clients", payload)
+
+    return {"client_id": client_id, "webhook_url": webhook_url}
+
+@app.patch("/client/{client_id}/prompt", response_model=dict)
+def update_prompt(client_id: str, data: UpdatePromptRequest):
+    supa_patch("clients", {"id": client_id}, {"prompt": data.prompt})
+    return {"ok": True}
+
+@app.post("/webhook/{client_id}")
+async def twilio_incoming_call(client_id: str, request: Request):
+    """
+    Twilio will POST form-data here for an incoming call.
+    We record caller/time/callsid and respond with TwiML to let Twilio record or speak.
+    """
+    form = await request.form()
+    from_number = form.get("From")
+    to_number = form.get("To")
+    call_sid = form.get("CallSid")
+    call_status = form.get("CallStatus")
+    timestamp = datetime.datetime.utcnow().isoformat()
+
+    # Fetch client
+    clients = supa_get("clients", {"id": client_id})
+    if not clients:
+        raise HTTPException(status_code=404, detail="client not found")
+    client = clients[0]
+
+    # Insert call log (start)
+    call_id = str(uuid.uuid4())
+    call_record = {
+        "id": call_id,
+        "client_id": client_id,
+        "from_number": from_number,
+        "to_number": to_number,
+        "call_sid": call_sid,
+        "start_time": timestamp,
+        "status": call_status or "in-progress"
+    }
+    supa_post("calls", call_record)
+
+    # TwiML: record caller and post recording to /recording/{client_id}
+    recording_callback_url = f"{BASE_URL}/recording/{client_id}"
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Connecting you to {client.get('name', 'our AI assistant')}. Please speak after the beep.</Say>
+  <Record maxLength="{TWILIO_RECORDING_MAX_SECONDS}" playBeep="true" action="{recording_callback_url}" />
+  <Hangup/>
+</Response>
+"""
+    return PlainTextResponse(content=twiml, media_type="application/xml")
+
+@app.post("/recording/{client_id}")
+async def recording_complete(client_id: str, request: Request, background_tasks: BackgroundTasks):
+    """
+    Twilio will POST recording metadata here after Record action completes.
+    Update call log with recording_url and duration, then process recording in background.
+    """
+    form = await request.form()
+    recording_url = form.get("RecordingUrl")  # often like https://api.twilio.com/2010-04-01/Accounts/AC.../Recordings/RE...
+    recording_sid = form.get("RecordingSid")
+    call_sid = form.get("CallSid")
+    duration = form.get("RecordingDuration")  # seconds or None
+    timestamp = datetime.datetime.utcnow().isoformat()
+
+    # Find call by call_sid in calls table
+    calls = supa_get("calls", {"call_sid": call_sid})
+    if not calls:
+        # Create new record if not found
+        call_log = {
+            "id": str(uuid.uuid4()),
+            "client_id": client_id,
+            "from_number": form.get("From"),
+            "to_number": form.get("To"),
+            "call_sid": call_sid,
+            "start_time": timestamp,
+            "status": "completed",
+            "duration_sec": int(duration) if duration else None,
+            "recording_url": recording_url
+        }
+        supa_post("calls", call_log)
+        call_id = call_log["id"]
+    else:
+        call = calls[0]
+        call_id = call["id"]
+        update_payload = {
+            "status": "completed",
+            "end_time": timestamp,
+            "duration_sec": int(duration) if duration else None,
+            "recording_url": recording_url,
+            "recording_sid": recording_sid,
+        }
+        supa_patch("calls", {"id": call_id}, update_payload)
+
+    # Background processing: download -> STT -> LLM -> TTS -> update DB
+    background_tasks.add_task(process_recording, recording_url, client_id, call_id)
+
+    return PlainTextResponse("<Response></Response>", media_type="application/xml")
+
+@app.get("/client/{client_id}/calls")
+def get_calls_for_client(client_id: str):
+    calls = supa_get("calls", {"client_id": client_id})
+    return JSONResponse(calls)
+
+# ---------- AI processing pipeline ----------
+# Load models lazily and reuse if available
+_whisper_model = None
+_gpt4all_model = None
+_tts_model = None
+
+def load_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        if whisper is None:
+            raise RuntimeError("whisper package not available. pip install openai-whisper and ensure ffmpeg is installed.")
+        # choose model size: "tiny","base","small","medium","large"
+        _whisper_model = whisper.load_model(os.getenv("WHISPER_MODEL", "base"))
+    return _whisper_model
+
+def load_gpt4all():
+    global _gpt4all_model
+    if _gpt4all_model is None:
+        if GPT4All is None:
+            _gpt4all_model = None
+            return None
+        model_path = GPT4ALL_MODEL_PATH
+        if not model_path:
+            # try default name
+            model_path = os.getenv("GPT4ALL_DEFAULT_MODEL")
+        _gpt4all_model = GPT4All(model=model_path) if model_path else None
+    return _gpt4all_model
+
+def load_tts():
+    global _tts_model
+    if _tts_model is None:
+        if TTS is None:
+            _tts_model = None
+            return None
+        # choose a model name available in Coqui TTS
+        tts_model_name = os.getenv("COQUI_TTS_MODEL", "tts_models/en/ljspeech/glow-tts")
+        _tts_model = TTS(tts_model_name)
+    return _tts_model
+
+def get_client_prompt(client_id: str) -> Optional[str]:
+    clients = supa_get("clients", {"id": client_id})
+    if not clients:
+        return None
+    return clients[0].get("prompt")
+
+def download_recording(recording_url: str) -> str:
+    """
+    Download Twilio recording to a local temp WAV file and return path.
+    Twilio recordings often require HTTP Basic auth (Account SID + Auth Token).
+    """
+    resp = None
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+        resp = requests.get(f"{recording_url}.wav", auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), stream=True)
+    else:
+        # try direct download
+        resp = requests.get(f"{recording_url}.wav", stream=True)
+    resp.raise_for_status()
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    with open(path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+    return path
+
+def process_recording(recording_url: str, client_id: str, call_id: str):
+    """
+    Background worker: downloads recording, transcribes, runs LLM, synthesizes TTS, updates DB.
+    """
+    try:
+        # 1. download
+        local_audio = download_recording(recording_url)
+
+        # 2. STT (Whisper)
+        transcript = None
+        try:
+            model = load_whisper()
+            result = model.transcribe(local_audio)
+            transcript = result.get("text", "").strip()
+        except Exception as e:
+            transcript = ""
+            # log error: keep going with empty transcript
+            print("Whisper error:", e)
+
+        # 3. fetch client prompt
+        client_prompt = get_client_prompt(client_id) or "You are a helpful support agent."
+
+        # 4. LLM response (GPT4All or fallback)
+        ai_reply = None
+        try:
+            gmodel = load_gpt4all()
+            if gmodel is not None:
+                # GPT4All python: .generate or .chat? Use .generate for generic prompts
+                prompt = f"{client_prompt}\n\nCustomer said: {transcript}\n\nAs the agent, reply concisely and politely:"
+                # The exact API may vary by gpt4all release; use generate() or chat() accordingly.
+                ai_reply = gmodel.generate(prompt, max_tokens=512)
+            else:
+                # fallback simple templated reply
+                ai_reply = f"Thanks for calling. We received: \"{transcript[:200]}\". Our team will follow up soon."
+        except Exception as e:
+            print("LLM error:", e)
+            ai_reply = f"Thanks for calling. We received: \"{transcript[:200]}\". Our team will follow up soon."
+
+        # 5. TTS synthesis (Coqui TTS) to local file
+        ai_audio_local = None
+        try:
+            tts_model = load_tts()
+            if tts_model is not None:
+                out_fd, out_path = tempfile.mkstemp(suffix=".wav")
+                tts_model.tts_to_file(text=ai_reply, file_path=out_path)
+                ai_audio_local = out_path
+        except Exception as e:
+            print("TTS error:", e)
+            ai_audio_local = None
+
+        # 6. Upload AI audio to Supabase storage (optional)
+        ai_audio_url = None
+        if ai_audio_local:
+            try:
+                dest_name = f"{client_id}/{call_id}_ai.wav"
+                uploaded = supa_upload_file(ai_audio_local, dest_name)
+                if uploaded:
+                    ai_audio_url = uploaded
+                else:
+                    # fallback to local file path (not ideal for Cloud Run)
+                    ai_audio_url = None
+            except Exception as e:
+                print("Supabase storage upload error:", e)
+
+        # 7. Save transcript + ai_reply + ai_audio_url to Supabase
+        update_payload = {
+            "transcript": transcript,
+            "ai_response": ai_reply,
+            "ai_audio_url": ai_audio_url
+        }
+        supa_patch("calls", {"id": call_id}, update_payload)
+
+        # cleanup local files
+        try:
+            os.remove(local_audio)
+        except Exception:
+            pass
+        if ai_audio_local:
+            try:
+                os.remove(ai_audio_local)
+            except Exception:
+                pass
+
+    except Exception as exc:
+        # log full error
+        print("process_recording failed:", exc)
+        # Optionally update calls table with error info
+        try:
+            supa_patch("calls", {"id": call_id}, {"processing_error": str(exc)})
+        except Exception:
+            pass
